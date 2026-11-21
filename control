@@ -1,0 +1,10 @@
+Package: com.yourname.vdcampro
+Name: Vdcampro
+Version: 2.3.6
+Architecture: iphoneos-arm64
+Description: Vdcampro 融合版相机替换内核
+Maintainer: yourname
+Author: yourname
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 15.0)
+Tag: purpose::extension
