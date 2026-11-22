@@ -3051,8 +3051,8 @@ static char kVCAMActionLongPressKey;
         }
     }
     if (!found) {
-        px = MAX(15, MIN(screenW - w - 15, ballF.center.x - w / 2));
-        py = (ballF.center.y > screenH / 2) ? 15 : screenH - h - 15;
+        px = MAX(15, MIN(screenW - w - 15, CGRectGetMidX(ballF) - w / 2));
+        py = (CGRectGetMidY(ballF) > screenH / 2) ? 15 : screenH - h - 15;
     }
     [UIView animateWithDuration:0.2 animations:^{ self->_panel.frame = CGRectMake(px, py, w, h); }];
 }
@@ -3062,7 +3062,7 @@ static char kVCAMActionLongPressKey;
     [UIView animateWithDuration:0.1 animations:^{
         btn.transform = CGAffineTransformMakeScale(0.94, 0.94);
         btn.alpha = 0.92;
-        btn.backgroundColor = [[UIColor systemCyanColor] colorWithAlphaComponent:0.72];
+        btn.backgroundColor = [[UIColor colorWithRed:0.20 green:0.75 blue:0.85 alpha:1.0] colorWithAlphaComponent:0.72];
     }];
 }
 - (void)btnUp:(UIButton *)btn {
@@ -3126,7 +3126,7 @@ static char kVCAMActionLongPressKey;
         size:11 color:[[UIColor whiteColor] colorWithAlphaComponent:0.65]];
     [licenseBox addSubview:deviceTitle];
     UILabel *deviceCode = [self makeLabel:vcam_deviceCode() frame:CGRectMake(12, 55, contentW - 82, 42)
-        size:12 color:[UIColor systemCyanColor]];
+        size:12 color:[UIColor colorWithRed:0.20 green:0.75 blue:0.85 alpha:1.0]];
     deviceCode.numberOfLines = 2;
     [licenseBox addSubview:deviceCode];
     UIButton *copyBtn = [self makeBtn:@"复制" bgColor:[[UIColor whiteColor] colorWithAlphaComponent:0.16]
