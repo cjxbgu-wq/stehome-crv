@@ -13,6 +13,7 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <Security/Security.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <CommonCrypto/CommonHMAC.h>
 #include <unistd.h>
 #include <string.h>
 #include <math.h>
@@ -32,6 +33,8 @@
 
 // 只内置 RSA 公钥；签发私钥绝不放入插件。卡密格式：VCAM1.payload.signature
 static NSString *const kVCAMLicensePublicKey = @"MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzfGTRh3CX6mO9v8mAJQm+ZUwBiKCNaENUytrsQp5Tx061AyyU5NRfmlrz5O9CKfoq8+dvOwpJaa9jVdYxdzJGxacN5q4XWg82GQdjh/klcw9tZxP3jlTy4n4GvekPaYu9nEmTzgko0ZoyOjpqOCV19jElPnh5N05YpZnonrjk2rRz6vPHYmwNWD3CFQrvn6r6L0C1uxcS3wbPNCt/Dzcmjubasggv6vlPVwgLKRw2DQ7jFKyZioesCazLr/RfR9KNnKSI7ZIozMaOjrgKgacF2NeXkAQ2dWbgseYBcXMBx3qTcmyCU/RjvceMLDybAFtxpg0DcbSBHjocvkktHOO2QIDAQAB";
+// 39 位短卡使用设备绑定 HMAC；旧 VCAM1 RSA 卡仍可验证。
+static NSString *const kVCAMShortLicenseKey = @"412fb8c44b6b8ca74919111c16976eacb1f30171e30c15367bd12c1679ec4270";
 
 // ============================ MSHook 声明 ============================
 #ifdef __cplusplus
@@ -294,10 +297,48 @@ static NSString *vcam_deviceCode(void) {
     return cached;
 }
 
+static NSDictionary *vcam_verifyShortLicenseCard(NSString *card, NSString **errorOut) {
+    NSString *clean = [[card stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] uppercaseString];
+    if (clean.length != 39) {
+        if (errorOut) *errorOut = @"短卡密应为 39 位、8 组，每组 4 位";
+        return nil;
+    }
+    NSCharacterSet *nonHex = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789ABCDEF"] invertedSet];
+    for (NSUInteger i = 0; i < clean.length; i++) {
+        unichar c = [clean characterAtIndex:i];
+        BOOL hyphenPosition = ((i + 1) % 5 == 0);
+        if ((hyphenPosition && c != '-') || (!hyphenPosition && [[NSString stringWithCharacters:&c length:1] rangeOfCharacterFromSet:nonHex].location != NSNotFound)) {
+            if (errorOut) *errorOut = @"卡密格式不正确，请完整输入连字符";
+            return nil;
+        }
+    }
+    NSString *compact = [clean stringByReplacingOccurrencesOfString:@"-" withString:@""];
+    uint32_t expires = (uint32_t)strtoull([[compact substringToIndex:8] UTF8String], NULL, 16);
+    NSString *message = [NSString stringWithFormat:@"SYSTEMSETTINGS2|%@|%08X", vcam_deviceCode(), expires];
+    const char *keyBytes = kVCAMShortLicenseKey.UTF8String;
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256, keyBytes, strlen(keyBytes), message.UTF8String, strlen(message.UTF8String), digest);
+    NSMutableString *expected = [NSMutableString stringWithCapacity:24];
+    for (int i = 0; i < 12; i++) [expected appendFormat:@"%02X", digest[i]];
+    NSString *provided = [compact substringFromIndex:8];
+    const char *a = expected.UTF8String, *b = provided.UTF8String;
+    unsigned char difference = 0;
+    for (int i = 0; i < 24; i++) difference |= (unsigned char)(a[i] ^ b[i]);
+    if (difference != 0) {
+        if (errorOut) *errorOut = @"卡密签名无效或与本机设备码不匹配";
+        return nil;
+    }
+    return @{
+        @"device": vcam_deviceCode(), @"expires": @(expires), @"issued": @0,
+        @"type": expires == 0 ? @"permanent" : @"temporary", @"version": @2,
+    };
+}
+
 // 返回已验签且绑定本机的 payload；任何格式、签名、设备或有效期错误均失败。
 static NSDictionary *vcam_verifyLicenseCard(NSString *card, NSString **errorOut) {
     if (errorOut) *errorOut = nil;
     NSString *clean = [card stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (![clean hasPrefix:@"VCAM1."]) return vcam_verifyShortLicenseCard(clean, errorOut);
     NSArray *parts = [clean componentsSeparatedByString:@"."];
     if (parts.count != 3 || ![parts[0] isEqualToString:@"VCAM1"]) {
         if (errorOut) *errorOut = @"卡密格式不正确";
@@ -2897,8 +2938,6 @@ static void vcam_installHooks(void) {
     if (self.rootViewController.presentedViewController) {
         return [super hitTest:point withEvent:event];
     }
-    // 三指双击需要透明根视图接收手势；普通单指／双指不进入此分支。
-    if (event.allTouches.count >= 3) return self.rootViewController.view;
     UIView *hit = [super hitTest:point withEvent:event];
     if (!hit || hit == self || hit == self.rootViewController.view) return nil;
     // 只命中悬浮球、面板及其交互子视图；其他透明区域返回 nil 穿透到原 App。
@@ -2914,6 +2953,7 @@ static void vcam_installHooks(void) {
 + (instancetype)shared;
 + (void)show;
 - (void)refreshPanelIfNeeded;
+- (void)toggleInterfaceFromGlobalGesture;
 @end
 
 static char kVCAMButtonColorKey;
@@ -2997,13 +3037,6 @@ static char kVCAMActionLongPressKey;
     _contentView.backgroundColor = [UIColor clearColor];
     [secureContainer addSubview:_contentView];
 
-    UITapGestureRecognizer *threeFinger = [[UITapGestureRecognizer alloc]
-        initWithTarget:self action:@selector(handleThreeFingerDoubleTap:)];
-    threeFinger.numberOfTouchesRequired = 3;
-    threeFinger.numberOfTapsRequired = 2;
-    threeFinger.cancelsTouchesInView = NO;
-    [rootVC.view addGestureRecognizer:threeFinger];
-
     CGFloat bs = 56;
     CGFloat bx = screen.size.width - bs - 20;
     CGFloat by = screen.size.height / 2 - bs / 2;
@@ -3036,24 +3069,56 @@ static char kVCAMActionLongPressKey;
     _licenseTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *timer) {
         [self updateStatusBadge];
     }];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(keyboardWillChangeFrame:)
+        name:UIKeyboardWillShowNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(keyboardWillChangeFrame:)
+        name:UIKeyboardWillChangeFrameNotification object:nil];
     if (!vcam_licenseIsValid()) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
             dispatch_get_main_queue(), ^{ [self showPanel]; });
     }
 }
-- (void)handlePan:(UIPanGestureRecognizer *)pan {
-    CGPoint t = [pan translationInView:_floatBtn.superview];
-    CGPoint c = CGPointMake(_floatBtn.center.x + t.x, _floatBtn.center.y + t.y);
-    CGFloat hw = _floatBtn.frame.size.width / 2;
-    CGFloat hh = _floatBtn.frame.size.height / 2;
-    c.x = MAX(hw, MIN(_window.bounds.size.width - hw, c.x));
-    c.y = MAX(hh, MIN(_window.bounds.size.height - hh, c.y));
-    _floatBtn.center = c;
-    [pan setTranslation:CGPointZero inView:_floatBtn.superview];
-    [self updatePanelPosition];
+- (CGPoint)constrainedMoveDelta:(CGPoint)delta {
+    CGRect ball = _floatBtn.frame;
+    CGFloat sw = _window.bounds.size.width, sh = _window.bounds.size.height;
+    delta.x = MAX(8 - CGRectGetMinX(ball), MIN(sw - 8 - CGRectGetMaxX(ball), delta.x));
+    delta.y = MAX(8 - CGRectGetMinY(ball), MIN(sh - 8 - CGRectGetMaxY(ball), delta.y));
+    if (_panel) {
+        CGRect panel = _panel.frame;
+        delta.x = MAX(8 - CGRectGetMinX(panel), MIN(sw - 8 - CGRectGetMaxX(panel), delta.x));
+        delta.y = MAX(8 - CGRectGetMinY(panel), MIN(sh - 8 - CGRectGetMaxY(panel), delta.y));
+    }
+    return delta;
 }
-- (void)handleThreeFingerDoubleTap:(UITapGestureRecognizer *)gesture {
-    if (gesture.state != UIGestureRecognizerStateEnded) return;
+- (void)moveBallAndPanelByDelta:(CGPoint)delta {
+    delta = [self constrainedMoveDelta:delta];
+    _floatBtn.center = CGPointMake(_floatBtn.center.x + delta.x, _floatBtn.center.y + delta.y);
+    if (_panel) _panel.center = CGPointMake(_panel.center.x + delta.x, _panel.center.y + delta.y);
+}
+- (void)handlePan:(UIPanGestureRecognizer *)pan {
+    CGPoint delta = [pan translationInView:_floatBtn.superview];
+    [self moveBallAndPanelByDelta:delta];
+    [pan setTranslation:CGPointZero inView:_floatBtn.superview];
+}
+- (void)handlePanelPan:(UIPanGestureRecognizer *)pan {
+    CGPoint delta = [pan translationInView:_contentView];
+    [self moveBallAndPanelByDelta:delta];
+    [pan setTranslation:CGPointZero inView:_contentView];
+}
+- (void)keyboardWillChangeFrame:(NSNotification *)notification {
+    if (!_panel || !_window) return;
+    CGRect keyboard = [notification.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+    CGRect inWindow = [_window convertRect:keyboard fromWindow:nil];
+    CGFloat keyboardTop = CGRectGetMinY(inWindow);
+    CGFloat overflow = CGRectGetMaxY(_panel.frame) - (keyboardTop - 8);
+    if (overflow > 0) {
+        CGRect frame = _panel.frame;
+        frame.origin.y = MAX(8, frame.origin.y - overflow);
+        NSTimeInterval duration = [notification.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+        [UIView animateWithDuration:MAX(0.1, duration) animations:^{ self->_panel.frame = frame; }];
+    }
+}
+- (void)toggleInterfaceFromGlobalGesture {
     [self setInterfaceHidden:!_interfaceHidden];
 }
 - (void)setInterfaceHidden:(BOOL)hidden {
@@ -3069,11 +3134,11 @@ static char kVCAMActionLongPressKey;
     if (_panel || _interfaceHidden) return;
     CGFloat screenW = _window.bounds.size.width;
     CGFloat screenH = _window.bounds.size.height;
-    CGFloat pw = MIN(330, screenW - 24);
-    CGFloat ph = MIN(430, screenH - 32);
+    CGFloat pw = MIN(292, screenW - 20);
+    CGFloat ph = MIN(368, screenH - 24);
     _panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, ph)];
     _panel.tag = 9901;
-    _panel.backgroundColor = [UIColor colorWithWhite:0.075 alpha:0.97];
+    _panel.backgroundColor = [UIColor colorWithWhite:0.075 alpha:0.75];
     _panel.layer.cornerRadius = 20;
     _panel.layer.borderWidth = 1.0;
     _panel.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.15].CGColor;
@@ -3152,9 +3217,9 @@ static char kVCAMActionLongPressKey;
 - (void)buildPanelContent {
     CGFloat cw = _panel.frame.size.width;
     CGFloat ch = _panel.frame.size.height;
-    CGFloat headerH = 48, footerH = 46;
+    CGFloat headerH = 42, footerH = 40;
     CGFloat pageH = ch - headerH - footerH;
-    CGFloat padding = 14;
+    CGFloat padding = 12;
     CGFloat contentW = cw - padding * 2;
     UIColor *muted = [[UIColor whiteColor] colorWithAlphaComponent:0.58];
     UIColor *line = [[UIColor whiteColor] colorWithAlphaComponent:0.10];
@@ -3162,17 +3227,20 @@ static char kVCAMActionLongPressKey;
 
     UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, cw, headerH)];
     [_panel addSubview:header];
-    UILabel *title = [self makeLabel:@"相机设置" frame:CGRectMake(padding, 10, 120, 28) size:18 color:[UIColor whiteColor]];
-    title.font = [UIFont systemFontOfSize:18 weight:UIFontWeightBold];
+    UIPanGestureRecognizer *panelPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePanelPan:)];
+    panelPan.cancelsTouchesInView = NO;
+    [header addGestureRecognizer:panelPan];
+    UILabel *title = [self makeLabel:@"相机设置" frame:CGRectMake(padding, 8, 100, 25) size:16 color:[UIColor whiteColor]];
+    title.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
     [header addSubview:title];
-    _statusBadge = [[UILabel alloc] initWithFrame:CGRectMake(cw - 132, 13, 76, 23)];
-    _statusBadge.layer.cornerRadius = 11.5;
+    _statusBadge = [[UILabel alloc] initWithFrame:CGRectMake(cw - 116, 11, 66, 21)];
+    _statusBadge.layer.cornerRadius = 10.5;
     _statusBadge.clipsToBounds = YES;
     _statusBadge.textAlignment = NSTextAlignmentCenter;
     _statusBadge.font = [UIFont systemFontOfSize:10 weight:UIFontWeightBold];
     [header addSubview:_statusBadge];
     UIButton *closeBtn = [self makeBtn:@"×" bgColor:[[UIColor whiteColor] colorWithAlphaComponent:0.10]
-        frame:CGRectMake(cw - 47, 9, 34, 30) tag:9];
+        frame:CGRectMake(cw - 42, 7, 30, 28) tag:9];
     closeBtn.titleLabel.font = [UIFont systemFontOfSize:23 weight:UIFontWeightLight];
     [header addSubview:closeBtn];
     UIView *headerLine = [[UIView alloc] initWithFrame:CGRectMake(padding, headerH - 1, contentW, 1)];
@@ -3191,7 +3259,7 @@ static char kVCAMActionLongPressKey;
     [_panel addSubview:_pager];
 
     NSMutableArray *pages = [NSMutableArray array];
-    CGFloat pageContentH = MAX(pageH, 318);
+    CGFloat pageContentH = MAX(pageH, 266);
     for (NSInteger i = 0; i < 3; i++) {
         UIScrollView *pageScroll = [[UIScrollView alloc] initWithFrame:CGRectMake(cw * i, 0, cw, pageH)];
         pageScroll.showsVerticalScrollIndicator = NO;
@@ -3206,27 +3274,27 @@ static char kVCAMActionLongPressKey;
 
     // 第一页：设备、激活与媒体入口。
     UIView *page0 = pages[0];
-    [page0 addSubview:[self makeLabel:@"01  设备与激活" frame:CGRectMake(padding, 4, contentW, 22) size:13 color:muted]];
-    UIView *deviceBox = [[UIView alloc] initWithFrame:CGRectMake(padding, 31, contentW, 70)];
+    [page0 addSubview:[self makeLabel:@"01  设备与激活" frame:CGRectMake(padding, 2, contentW, 18) size:12 color:muted]];
+    UIView *deviceBox = [[UIView alloc] initWithFrame:CGRectMake(padding, 24, contentW, 58)];
     deviceBox.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.055];
     deviceBox.layer.cornerRadius = 10;
     [page0 addSubview:deviceBox];
-    [deviceBox addSubview:[self makeLabel:@"设备码 ID · 一机一码" frame:CGRectMake(10, 6, contentW - 20, 15) size:10 color:muted]];
-    UILabel *deviceCode = [self makeLabel:vcam_deviceCode() frame:CGRectMake(10, 24, contentW - 74, 39) size:11 color:accent];
+    [deviceBox addSubview:[self makeLabel:@"设备码 ID · 一机一码" frame:CGRectMake(9, 4, contentW - 18, 13) size:9 color:muted]];
+    UILabel *deviceCode = [self makeLabel:vcam_deviceCode() frame:CGRectMake(9, 19, contentW - 62, 34) size:10 color:accent];
     deviceCode.numberOfLines = 2;
     deviceCode.lineBreakMode = NSLineBreakByCharWrapping;
-    deviceCode.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightMedium];
+    deviceCode.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightMedium];
     [deviceBox addSubview:deviceCode];
     UIButton *copyBtn = [self makeBtn:@"复制" bgColor:[[UIColor whiteColor] colorWithAlphaComponent:0.12]
-        frame:CGRectMake(contentW - 55, 25, 46, 32) tag:21];
+        frame:CGRectMake(contentW - 49, 19, 41, 30) tag:21];
     copyBtn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
     [deviceBox addSubview:copyBtn];
 
-    _licenseInput = [[UITextField alloc] initWithFrame:CGRectMake(padding, 109, contentW, 34)];
-    _licenseInput.placeholder = @"输入永久卡密或临时卡密";
+    _licenseInput = [[UITextField alloc] initWithFrame:CGRectMake(padding, 88, contentW, 30)];
+    _licenseInput.placeholder = @"输入 39 位永久或临时卡密";
+    _licenseInput.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightMedium];
     _licenseInput.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.09];
     _licenseInput.textColor = [UIColor whiteColor];
-    _licenseInput.font = [UIFont systemFontOfSize:11];
     _licenseInput.layer.cornerRadius = 8;
     _licenseInput.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 9, 1)];
     _licenseInput.leftViewMode = UITextFieldViewModeAlways;
@@ -3234,20 +3302,20 @@ static char kVCAMActionLongPressKey;
     _licenseInput.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
     [page0 addSubview:_licenseInput];
     UIButton *activateBtn = [self makeBtn:@"验证并激活" bgColor:[accent colorWithAlphaComponent:0.72]
-        frame:CGRectMake(padding, 150, contentW, 36) tag:20];
+        frame:CGRectMake(padding, 124, contentW, 32) tag:20];
     [page0 addSubview:activateBtn];
-    _licenseStatus = [self makeLabel:@"" frame:CGRectMake(padding + 2, 190, contentW - 4, 28) size:10 color:[UIColor systemOrangeColor]];
+    _licenseStatus = [self makeLabel:@"" frame:CGRectMake(padding + 2, 160, contentW - 4, 24) size:9 color:[UIColor systemOrangeColor]];
     _licenseStatus.numberOfLines = 2;
     [page0 addSubview:_licenseStatus];
     UIButton *mediaBtn = [self makeBtn:@"选择视频 / 图片" bgColor:[accent colorWithAlphaComponent:0.25]
-        frame:CGRectMake(padding, 224, contentW, 36) tag:1];
+        frame:CGRectMake(padding, 188, contentW, 32) tag:1];
     [page0 addSubview:mediaBtn];
-    UIView *switchBg = [[UIView alloc] initWithFrame:CGRectMake(padding, 269, contentW, 40)];
+    UIView *switchBg = [[UIView alloc] initWithFrame:CGRectMake(padding, 226, contentW, 34)];
     switchBg.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.055];
     switchBg.layer.cornerRadius = 10;
     [page0 addSubview:switchBg];
-    [switchBg addSubview:[self makeLabel:@"虚拟相机总开关" frame:CGRectMake(12, 0, contentW - 80, 40) size:13 color:[UIColor whiteColor]]];
-    _toggleSw = [[UISwitch alloc] initWithFrame:CGRectMake(contentW - 62, 4.5, 51, 31)];
+    [switchBg addSubview:[self makeLabel:@"虚拟相机总开关" frame:CGRectMake(10, 0, contentW - 72, 34) size:12 color:[UIColor whiteColor]]];
+    _toggleSw = [[UISwitch alloc] initWithFrame:CGRectMake(contentW - 59, 1.5, 51, 31)];
     _toggleSw.onTintColor = [UIColor systemGreenColor];
     _toggleSw.transform = CGAffineTransformMakeScale(0.84, 0.84);
     [_toggleSw addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
@@ -3255,14 +3323,14 @@ static char kVCAMActionLongPressKey;
 
     // 第二页：只针对视频的画布缩放，以及原有方向、位移和播放控制。
     UIView *page1 = pages[1];
-    [page1 addSubview:[self makeLabel:@"02  视频画面" frame:CGRectMake(padding, 4, contentW, 22) size:13 color:muted]];
-    _zoomValue = [self makeLabel:@"" frame:CGRectMake(padding, 32, contentW - 60, 20) size:13 color:[UIColor whiteColor]];
+    [page1 addSubview:[self makeLabel:@"02  视频画面" frame:CGRectMake(padding, 2, contentW, 18) size:12 color:muted]];
+    _zoomValue = [self makeLabel:@"" frame:CGRectMake(padding, 26, contentW - 58, 18) size:12 color:[UIColor whiteColor]];
     [page1 addSubview:_zoomValue];
     UIButton *zoomReset = [self makeBtn:@"1.0×" bgColor:[[UIColor whiteColor] colorWithAlphaComponent:0.10]
-        frame:CGRectMake(cw - padding - 50, 28, 50, 28) tag:109];
+        frame:CGRectMake(cw - padding - 48, 23, 48, 25) tag:109];
     zoomReset.titleLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightSemibold];
     [page1 addSubview:zoomReset];
-    _zoomSlider = [[UISlider alloc] initWithFrame:CGRectMake(padding, 57, contentW, 28)];
+    _zoomSlider = [[UISlider alloc] initWithFrame:CGRectMake(padding, 48, contentW, 24)];
     _zoomSlider.minimumValue = 0.5;
     _zoomSlider.maximumValue = 3.0;
     _zoomSlider.value = gVideoZoom;
@@ -3270,54 +3338,54 @@ static char kVCAMActionLongPressKey;
     _zoomSlider.maximumTrackTintColor = [[UIColor whiteColor] colorWithAlphaComponent:0.18];
     [_zoomSlider addTarget:self action:@selector(zoomChanged:) forControlEvents:UIControlEventValueChanged];
     [page1 addSubview:_zoomSlider];
-    [page1 addSubview:[self makeLabel:@"0.5×  缩小" frame:CGRectMake(padding, 85, 100, 14) size:9 color:muted]];
-    UILabel *maxZoom = [self makeLabel:@"放大  3.0×" frame:CGRectMake(cw - padding - 100, 85, 100, 14) size:9 color:muted];
+    [page1 addSubview:[self makeLabel:@"0.5×  缩小" frame:CGRectMake(padding, 72, 90, 12) size:8 color:muted]];
+    UILabel *maxZoom = [self makeLabel:@"放大  3.0×" frame:CGRectMake(cw - padding - 90, 72, 90, 12) size:8 color:muted];
     maxZoom.textAlignment = NSTextAlignmentRight;
     [page1 addSubview:maxZoom];
 
-    CGFloat dpadSize = 120;
-    UIView *dpadBg = [[UIView alloc] initWithFrame:CGRectMake(padding, 112, dpadSize, dpadSize)];
+    CGFloat dpadSize = 108;
+    UIView *dpadBg = [[UIView alloc] initWithFrame:CGRectMake(padding, 94, dpadSize, dpadSize)];
     dpadBg.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.045];
     dpadBg.layer.cornerRadius = 14;
     [page1 addSubview:dpadBg];
     NSArray *dIcons = @[@"", @"↑", @"", @"←", @"◎", @"→", @"", @"↓", @""];
     int dTags[] = {0, 100, 0, 102, 103, 104, 0, 105, 0};
-    CGFloat dSize = 34, dGap = 5;
+    CGFloat dSize = 30, dGap = 4;
     for (int i = 0; i < 9; i++) {
         int row = i / 3, col = i % 3;
         if (dTags[i] == 0) continue;
         UIColor *bgC = (dTags[i] == 103) ? [accent colorWithAlphaComponent:0.65]
             : [[UIColor whiteColor] colorWithAlphaComponent:0.12];
         UIButton *btn = [self makeBtn:dIcons[i] bgColor:bgC
-            frame:CGRectMake(6 + col * (dSize + dGap), 6 + row * (dSize + dGap), dSize, dSize) tag:dTags[i]];
+            frame:CGRectMake(5 + col * (dSize + dGap), 5 + row * (dSize + dGap), dSize, dSize) tag:dTags[i]];
         btn.layer.cornerRadius = 8;
         [dpadBg addSubview:btn];
     }
-    CGFloat sideX = padding + dpadSize + 12;
+    CGFloat sideX = padding + dpadSize + 10;
     CGFloat sideW = cw - sideX - padding;
     CGFloat halfW = (sideW - 7) / 2;
     UIButton *rotBtn = [self makeBtn:@"旋转" bgColor:[[UIColor systemPurpleColor] colorWithAlphaComponent:0.58]
-        frame:CGRectMake(sideX, 112, halfW, 34) tag:101];
+        frame:CGRectMake(sideX, 94, halfW, 30) tag:101];
     UIButton *flipBtn = [self makeBtn:@"翻转" bgColor:[[UIColor systemPurpleColor] colorWithAlphaComponent:0.58]
-        frame:CGRectMake(sideX + halfW + 7, 112, halfW, 34) tag:106];
+        frame:CGRectMake(sideX + halfW + 7, 94, halfW, 30) tag:106];
     UIButton *playBtn = [self makeBtn:@"播放" bgColor:[[UIColor whiteColor] colorWithAlphaComponent:0.12]
-        frame:CGRectMake(sideX, 155, halfW, 34) tag:107];
+        frame:CGRectMake(sideX, 133, halfW, 30) tag:107];
     UIButton *pauseBtn = [self makeBtn:@"暂停" bgColor:[[UIColor whiteColor] colorWithAlphaComponent:0.12]
-        frame:CGRectMake(sideX + halfW + 7, 155, halfW, 34) tag:108];
+        frame:CGRectMake(sideX + halfW + 7, 133, halfW, 30) tag:108];
     for (UIButton *btn in @[rotBtn, flipBtn, playBtn, pauseBtn]) {
         btn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
         [page1 addSubview:btn];
     }
     UILabel *zoomNote = [self makeLabel:@"缩放仅作用于视频与播放器；图片模式不应用缩放。"
-        frame:CGRectMake(padding, 248, contentW, 34) size:10 color:muted];
+        frame:CGRectMake(padding, 214, contentW, 28) size:9 color:muted];
     zoomNote.numberOfLines = 2;
     [page1 addSubview:zoomNote];
 
     // 第三页：六动作与隐藏入口，视频 1／2／3 面板入口已移除。
     UIView *page2 = pages[2];
-    [page2 addSubview:[self makeLabel:@"03  动作序列" frame:CGRectMake(padding, 4, contentW, 22) size:13 color:muted]];
+    [page2 addSubview:[self makeLabel:@"03  动作序列" frame:CGRectMake(padding, 2, contentW, 18) size:12 color:muted]];
     UILabel *actionHint = [self makeLabel:@"单击播放动作 · 长按 2 秒设置起始／结束时间"
-        frame:CGRectMake(padding, 30, contentW, 28) size:10 color:muted];
+        frame:CGRectMake(padding, 24, contentW, 24) size:9 color:muted];
     actionHint.numberOfLines = 2;
     [page2 addSubview:actionHint];
     CGFloat actionGap = 7;
@@ -3325,10 +3393,10 @@ static char kVCAMActionLongPressKey;
     for (NSInteger action = 1; action <= 6; action++) {
         NSInteger index = action - 1;
         CGFloat x = padding + (index % 3) * (actionW + actionGap);
-        CGFloat ay = 68 + (index / 3) * 44;
+        CGFloat ay = 56 + (index / 3) * 38;
         UIButton *actionBtn = [self makeBtn:vcam_actionName(action)
             bgColor:[[UIColor systemTealColor] colorWithAlphaComponent:0.38]
-            frame:CGRectMake(x, ay, actionW, 36) tag:300 + action];
+            frame:CGRectMake(x, ay, actionW, 32) tag:300 + action];
         actionBtn.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
         UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
             initWithTarget:self action:@selector(actionLongPress:)];
@@ -3338,13 +3406,13 @@ static char kVCAMActionLongPressKey;
         [page2 addSubview:actionBtn];
     }
     UIButton *exitAction = [self makeBtn:@"退出动作并恢复循环" bgColor:[[UIColor systemOrangeColor] colorWithAlphaComponent:0.25]
-        frame:CGRectMake(padding, 160, contentW, 34) tag:300];
+        frame:CGRectMake(padding, 138, contentW, 30) tag:300];
     [page2 addSubview:exitAction];
     UILabel *actionNote = [self makeLabel:@"动作结束后定格最后一帧；时间单位为秒。"
-        frame:CGRectMake(padding, 204, contentW, 28) size:10 color:muted];
+        frame:CGRectMake(padding, 176, contentW, 22) size:9 color:muted];
     [page2 addSubview:actionNote];
     UIButton *hideBtn = [self makeBtn:@"隐藏面板与悬浮球 · 三指双击唤出" bgColor:[[UIColor systemIndigoColor] colorWithAlphaComponent:0.42]
-        frame:CGRectMake(padding, 246, contentW, 38) tag:10];
+        frame:CGRectMake(padding, 208, contentW, 34) tag:10];
     hideBtn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
     [page2 addSubview:hideBtn];
 
@@ -3353,13 +3421,13 @@ static char kVCAMActionLongPressKey;
     UIView *footerLine = [[UIView alloc] initWithFrame:CGRectMake(padding, 0, contentW, 1)];
     footerLine.backgroundColor = line;
     [footer addSubview:footerLine];
-    UIButton *prevBtn = [self makeBtn:@"‹" bgColor:[UIColor clearColor] frame:CGRectMake(8, 6, 44, 34) tag:30];
-    UIButton *nextBtn = [self makeBtn:@"›" bgColor:[UIColor clearColor] frame:CGRectMake(cw - 52, 6, 44, 34) tag:31];
+    UIButton *prevBtn = [self makeBtn:@"‹" bgColor:[UIColor clearColor] frame:CGRectMake(8, 4, 40, 31) tag:30];
+    UIButton *nextBtn = [self makeBtn:@"›" bgColor:[UIColor clearColor] frame:CGRectMake(cw - 48, 4, 40, 31) tag:31];
     prevBtn.titleLabel.font = [UIFont systemFontOfSize:30 weight:UIFontWeightLight];
     nextBtn.titleLabel.font = [UIFont systemFontOfSize:30 weight:UIFontWeightLight];
     [footer addSubview:prevBtn];
     [footer addSubview:nextBtn];
-    _pageControl = [[UIPageControl alloc] initWithFrame:CGRectMake((cw - 140) / 2, 7, 140, 32)];
+    _pageControl = [[UIPageControl alloc] initWithFrame:CGRectMake((cw - 130) / 2, 4, 130, 31)];
     _pageControl.numberOfPages = 3;
     _pageControl.currentPage = 0;
     _pageControl.pageIndicatorTintColor = [[UIColor whiteColor] colorWithAlphaComponent:0.22];
@@ -3566,6 +3634,99 @@ static char kVCAMActionLongPressKey;
 - (void)refreshPanelIfNeeded { if (_panel) [self updateStatusBadge]; }
 @end
 
+
+// ============================================================================
+// 全局三指双击观察：只观察 UIApplication 事件，不消费、不改写原始触摸。
+// ============================================================================
+static BOOL gTripleCandidate = NO;
+static BOOL gTripleInvalid = NO;
+static NSTimeInterval gTripleStartedAt = 0;
+static NSTimeInterval gLastTripleTapAt = 0;
+static NSMutableDictionary *gTripleOrigins = nil;
+
+static NSString *vcam_touchKey(UITouch *touch) {
+    return [NSString stringWithFormat:@"%p", touch];
+}
+static void vcam_finishTripleCandidate(NSTimeInterval timestamp) {
+    BOOL valid = gTripleCandidate && !gTripleInvalid && gTripleOrigins.count == 3 &&
+        timestamp - gTripleStartedAt <= 0.5;
+    gTripleCandidate = NO;
+    gTripleInvalid = NO;
+    gTripleOrigins = nil;
+    if (!valid) return;
+    if (gLastTripleTapAt > 0 && timestamp - gLastTripleTapAt <= 0.6) {
+        gLastTripleTapAt = 0;
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+            CFSTR("com.systemsettings.interfaceToggle"), NULL, NULL, YES);
+    } else {
+        gLastTripleTapAt = timestamp;
+    }
+}
+static void vcam_observeGlobalTouchEvent(UIEvent *event) {
+    if (!event || event.type != UIEventTypeTouches) return;
+    NSSet *touches = event.allTouches;
+    NSTimeInterval timestamp = event.timestamp;
+    if (!gTripleCandidate) {
+        if (touches.count != 3) return;
+        gTripleCandidate = YES;
+        gTripleInvalid = NO;
+        gTripleStartedAt = timestamp;
+        gTripleOrigins = [NSMutableDictionary dictionaryWithCapacity:3];
+        for (UITouch *touch in touches) {
+            gTripleOrigins[vcam_touchKey(touch)] = [NSValue valueWithCGPoint:[touch locationInView:nil]];
+        }
+    } else if (touches.count > 3) {
+        gTripleInvalid = YES;
+    }
+    if (!gTripleCandidate) return;
+    if (timestamp - gTripleStartedAt > 0.5) gTripleInvalid = YES;
+    BOOL anyActive = NO;
+    for (UITouch *touch in touches) {
+        if (touch.phase == UITouchPhaseCancelled) gTripleInvalid = YES;
+        if (touch.phase != UITouchPhaseEnded && touch.phase != UITouchPhaseCancelled) anyActive = YES;
+        NSValue *origin = gTripleOrigins[vcam_touchKey(touch)];
+        if (!origin) { gTripleInvalid = YES; continue; }
+        CGPoint p0 = origin.CGPointValue;
+        CGPoint p1 = [touch locationInView:nil];
+        if (hypot(p1.x - p0.x, p1.y - p0.y) > 28.0) gTripleInvalid = YES;
+    }
+    if (!anyActive) vcam_finishTripleCandidate(timestamp);
+}
+
+typedef void (*VCAMSendEventIMP)(id, SEL, UIEvent *);
+static VCAMSendEventIMP gOriginalSendEvent = NULL;
+static void vcam_replacementSendEvent(id self, SEL _cmd, UIEvent *event) {
+    if (gOriginalSendEvent) gOriginalSendEvent(self, _cmd, event);
+    @try { vcam_observeGlobalTouchEvent(event); } @catch (NSException *e) {}
+}
+static void vcam_installGlobalTouchObserver(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        MSHookMessageEx([UIApplication class], @selector(sendEvent:),
+            (IMP)vcam_replacementSendEvent, (IMP *)&gOriginalSendEvent);
+    });
+}
+
+static void vcam_globalToggleCallback(CFNotificationCenterRef center, void *observer,
+    CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        static NSTimeInterval lastToggle = 0;
+        NSTimeInterval now = CACurrentMediaTime();
+        if (now - lastToggle < 0.25) return; // 多进程重复通知去重。
+        lastToggle = now;
+        [[FWCtrl shared] toggleInterfaceFromGlobalGesture];
+    });
+}
+static void vcam_installSpringBoardTouchBridge(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+            vcam_globalToggleCallback, CFSTR("com.systemsettings.interfaceToggle"), NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        vcam_installGlobalTouchObserver();
+    });
+}
+
 @implementation UIHlp
 + (instancetype)shared {
     static UIHlp *i; static dispatch_once_t o;
@@ -3703,6 +3864,7 @@ static void vcamplus_init(void) {
 
         // Safari UI 进程：不 hook
         if ([bid isEqualToString:@"com.apple.mobilesafari"] || [proc isEqualToString:@"Safari"]) {
+            vcam_installGlobalTouchObserver();
             // Safari UI 进程同样不碰。三个进程（UI / WebContent / GPU）全部不接触，
             // Safari 完全运行在原生路径上，100% 能打开。
             // 代价：Safari 网页的 getUserMedia 不替换。
@@ -3712,6 +3874,7 @@ static void vcamplus_init(void) {
 
         // SpringBoard
         if ([proc isEqualToString:@"SpringBoard"]) {
+            vcam_installSpringBoardTouchBridge();
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                 dispatch_get_main_queue(), ^{ [FWCtrl show]; });
             return;
@@ -3728,5 +3891,6 @@ static void vcamplus_init(void) {
         gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
         vcam_installHooks();
         vcam_installWebCamHook();
+        vcam_installGlobalTouchObserver();
     }
 }
